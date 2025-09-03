@@ -362,12 +362,9 @@ jobs:
           RAY_TAG="${{ steps.meta.outputs.version || 'latest' }}-ray"
           echo "RAY_TAG=$RAY_TAG" >> $GITHUB_ENV
 
-          # Create a temporary Dockerfile for Ray image
+          # Create a temporary Dockerfile for Ray image - NO MULTI-STAGE
           cat > Dockerfile.ray.tmp << 'EOF'
-          # Stage 1: Extract from llama-server image
-          FROM ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} as llama-image
-
-          # Stage 2: Build the Ray image
+          # Simple Ray image without multi-stage complexities
           FROM rayproject/ray:2.9.0
 
           # Install Python dependencies for LLaMA and metrics
@@ -377,22 +374,59 @@ jobs:
           RUN mkdir -p /models /app/metrics /app/ray_serve && \
               chmod -R 777 /models /app
 
-          # Copy the LLaMA server binary from the first stage
-          COPY --from=llama-image /usr/local/bin/llama-server /usr/local/bin/
+          # Create lib directory
+          RUN mkdir -p /usr/local/lib /usr/local/bin
+          
+          # We'll download llama.cpp and build the server directly
+          RUN apt-get update && apt-get install -y \
+              build-essential \
+              cmake \
+              git \
+              libcurl4-openssl-dev \
+              pkg-config \
+              wget \
+              && rm -rf /var/lib/apt/lists/*
 
-          # Copy libraries directory
-          RUN mkdir -p /usr/local/lib
-          COPY --from=llama-image /usr/local/lib/ /usr/local/lib/ || true
-          RUN ldconfig
+          # Build llama.cpp
+          WORKDIR /tmp/build
+          RUN wget -O llama-cpp.tar.gz https://github.com/ggerganov/llama.cpp/archive/refs/heads/master.tar.gz && \
+              tar -xzf llama-cpp.tar.gz && \
+              mv llama.cpp-master llama.cpp
+              
+          WORKDIR /tmp/build/llama.cpp
+          RUN cmake -B build \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGGML_BLAS=OFF \
+              -DGGML_CUBLAS=OFF \
+              -DGGML_METAL=OFF \
+              -DGGML_HIPBLAS=OFF \
+              -DGGML_ACCELERATE=OFF \
+              -DLLAMA_BUILD_TESTS=OFF \
+              -DLLAMA_BUILD_EXAMPLES=OFF \
+              -DLLAMA_BUILD_SERVER=ON \
+              && cmake --build build --config Release --target llama-server -j$(nproc)
+              
+          # Copy the binary to the expected location
+          RUN cp /tmp/build/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server && \
+              chmod +x /usr/local/bin/llama-server
+              
+          # Copy any shared libraries
+          RUN if [ -d /tmp/build/llama.cpp/build/lib ]; then \
+                cp -r /tmp/build/llama.cpp/build/lib/* /usr/local/lib/ 2>/dev/null || true; \
+              fi && \
+              ldconfig
 
-          # Copy the metrics exporter script
+          # Copy the metrics exporter script and Ray serve script
           COPY metrics/exporter.py /app/metrics/exporter.py
           RUN chmod +x /app/metrics/exporter.py
-
-          # Copy Ray serve script
           COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
           EOF
-
+          
+          # Display the Dockerfile for debugging
+          echo "=== Generated Dockerfile.ray.tmp ==="
+          cat Dockerfile.ray.tmp
+          echo "=== End of Dockerfile ==="
+          
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             # For actual pushes, build and push to Docker Hub
             docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray.tmp .
