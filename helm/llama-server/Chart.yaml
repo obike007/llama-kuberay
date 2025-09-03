@@ -1,0 +1,14 @@
+apiVersion: v2
+name: llama-server
+description: A Helm chart for LLaMA.cpp server with Prometheus monitoring
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+maintainers:
+  - name: Your Name
+    email: your.email@example.com
+keywords:
+  - llm
+  - llama
+  - ai
+  - inference

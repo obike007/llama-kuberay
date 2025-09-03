@@ -1,1 +1,1 @@
-# llama-kuberay
+# llama-helm
