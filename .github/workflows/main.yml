@@ -367,6 +367,9 @@ jobs:
           # Simple Ray image without multi-stage complexities
           FROM rayproject/ray:2.9.0
 
+          # Switch to root user forinstallation and setup
+          USER root
+
           # Install Python dependencies for LLaMA and metrics
           RUN pip install prometheus-client requests psutil
 
@@ -421,6 +424,20 @@ jobs:
           RUN chmod +x /app/metrics/exporter.py
           COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
           EOF
+
+          # Clean up build files to reduce image size
+          RUN rm -rf /tmp/build
+
+          # Switch back to ray user for running the application
+          USER ray
+
+          # Set working directory
+          WORKDIR /app/ray_serve
+
+          # Command to run (optional, as Ray images typically have their own entrypoint)
+          # CMD ["python", "llama_serve.py"]
+          EOF
+
           
           # Display the Dockerfile for debugging
           echo "=== Generated Dockerfile.ray.tmp ==="
