@@ -1,0 +1,77 @@
+# Default values for llama-server
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+image:
+  repository: yourusername/llama-server  # Replace with your Docker Hub username
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+podAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+service:
+  type: NodePort
+  llama:
+    port: 8084
+    nodePort: 30080
+  metrics:
+    port: 9090
+    nodePort: 30090
+
+resources:
+  limits:
+    cpu: 2
+    memory: 4Gi
+  requests:
+    cpu: 1
+    memory: 2Gi
+
+persistence:
+  enabled: true
+  size: 5Gi
+  mountPath: /models
+  storageClass: standard
+
+modelConfig:
+  downloadModel: true
+  modelUrl: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf"
+  modelFileName: "model.gguf"
+
+# Prometheus ServiceMonitor configuration
+serviceMonitor:
+  enabled: true
+  namespace: monitoring
+  interval: 15s
+  scrapeTimeout: 10s
+  labels: {}
+
+# Optional ingress
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: llama.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Server configuration
+server:
+  context: 2048
+  threads: 4
+  batchSize: 512
+  keepAlive: -1  # -1 means infinity
+  verbose: true
+  enableSlots: true
+  nCtx: 2048
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

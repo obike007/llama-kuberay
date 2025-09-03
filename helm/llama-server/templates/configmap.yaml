@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "llama-server.fullname" . }}-config
+  labels:
+    {{- include "llama-server.labels" . | nindent 4 }}
+data:
+  server-config.json: |
+    {
+      "model": "/models/{{ .Values.modelConfig.modelFileName }}",
+      "ctx_size": {{ .Values.server.nCtx }},
+      "batch_size": {{ .Values.server.batchSize }},
+      "threads": {{ .Values.server.threads }},
+      "keep_alive": {{ .Values.server.keepAlive }},
+      "verbose": {{ .Values.server.verbose }}
+    }

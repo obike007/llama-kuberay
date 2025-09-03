@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "llama-server.fullname" . }}
+  labels:
+    {{- include "llama-server.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.llama.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.llama.nodePort }}
+      nodePort: {{ .Values.service.llama.nodePort }}
+      {{- end }}
+    - port: {{ .Values.service.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.metrics.nodePort }}
+      nodePort: {{ .Values.service.metrics.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "llama-server.selectorLabels" . | nindent 4 }}
