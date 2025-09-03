@@ -1,8 +1,26 @@
+# Start with Ray image
 FROM rayproject/ray:2.9.0
+
+# Switch to root user for installation and setup
+USER root
+
+# Install dependencies
 RUN pip install --no-cache-dir prometheus-client requests psutil
-RUN mkdir -p /models /app/metrics /app/ray_serve && chmod -R 777 /models /app
+
+# Create directories with proper permissions
+RUN mkdir -p /models /app/metrics /app/ray_serve && \
+    chmod -R 777 /models /app
+
+# Copy application files
 COPY metrics/exporter.py /app/metrics/exporter.py
 COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
 RUN chmod +x /app/metrics/exporter.py
+
+# Switch back to ray user for better security
+USER ray
+
+# Set working directory
 WORKDIR /app/ray_serve
+
+# Default command
 CMD ["python", "-m", "ray.serve", "run", "llama_serve:app"]

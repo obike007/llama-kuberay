@@ -464,40 +464,66 @@ jobs:
           CMD ["./start.sh"]
           EOF
           
-    # Build Ray image using the existing ray_serve/llama_serve.py file
+    # Build Ray image locally with proper permissions
       - name: Build Ray image locally
         run: |
+          # Create a simplified Python-based Dockerfile for Ray
+          cat > Dockerfile.ray.tmp << 'EOF'
+          # Start with Python image to avoid permission issues
+          FROM python:3.9-slim
+          
+          # Install Ray and other dependencies
+          RUN pip install --no-cache-dir "ray[serve]==2.9.0" prometheus-client requests psutil
+          
+          # Create directories
+          RUN mkdir -p /models /app/metrics /app/ray_serve && \
+              chmod -R 777 /models /app
+          
+          # Copy application files
+          COPY metrics/exporter.py /app/metrics/exporter.py
+          COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
+          RUN chmod +x /app/metrics/exporter.py
+          
+          # Create convenient entry script
+          RUN echo '#!/bin/bash\n\
+          echo "Starting Ray server..."\n\
+          python -m ray.serve run llama_serve:app\n\
+          ' > /app/ray_serve/start.sh && chmod +x /app/ray_serve/start.sh
+          
+          # Set working directory
+          WORKDIR /app/ray_serve
+          
+          # Default command
+          CMD ["./start.sh"]
+          EOF
+          
+          # Display the Dockerfile for debugging
+          echo "=== Dockerfile.ray.tmp ==="
+          cat Dockerfile.ray.tmp
+          echo "=========================="
+          
+          # Build Ray image locally
           echo "Building Ray image locally..."
           docker build -t llama-ray:latest -f Dockerfile.ray.tmp .
-
-          # Tag for registry reference
-          docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:local-ray
-
-          # Only push to registry if not a PR
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-            # Try pushing with retry logic
-            MAX_RETRIES=3
-            RETRY_COUNT=0
-            SLEEP_TIME=10
-
-            until [ $RETRY_COUNT -ge $MAX_RETRIES ]
-            do
-              if docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray; then
-                echo "Successfully pushed Ray image to Docker Hub"
-                break
-              else
-                RETRY_COUNT=$((RETRY_COUNT+1))
-                if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
-                  echo "Failed to push after $MAX_RETRIES attempts, continuing..."
-                  break
-                fi
-                SLEEP_TIME=$((SLEEP_TIME * 2))
-                echo "Push failed. Retrying in $SLEEP_TIME seconds..."
-                sleep $SLEEP_TIME
-              fi
-            done
+          
+          # Verify the build succeeded
+          if [ $? -eq 0 ]; then
+            echo "Ray image built successfully"
+            
+            # Tag for registry reference
+            docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:local-ray
+            
+            # Only push to registry if not a PR
+            if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+              echo "Pushing Ray image to Docker Hub..."
+              docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray
+              docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray || echo "Failed to push to Docker Hub, continuing..."
+            fi
+          else
+            echo "Ray image build failed"
+            exit 1
           fi
-
+          
           echo "RAY_TAG=latest" >> $GITHUB_ENV
           
         # Rest of your build process...
