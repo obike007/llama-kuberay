@@ -343,67 +343,66 @@ jobs:
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
 
-      # Build and push Docker image for LLaMA server
-      - name: Build and push LLaMA server image
-        id: build-and-push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          no-cache: true
-
-      # Build and push Ray integration image
-      - name: Build and push Ray integration image
+      # Build standard LLaMA server image locally for KIND - ADD THIS HERE
+      - name: Build standard LLaMA server image locally
         run: |
-            # Set Ray image tag
-            RAY_TAG="${{ steps.meta.outputs.version || 'latest' }}-ray"
-            echo "RAY_TAG=$RAY_TAG" >> $GITHUB_ENV
-            
-            # Create a simplified Dockerfile that doesn't require building from source
-            cat > Dockerfile.ray.tmp << 'EOF'
-            # Base on Python image instead of Ray image
-            FROM python:3.9-slim
-            
-            # Install Ray and other dependencies
-            RUN pip install ray[serve] prometheus-client requests psutil
-            
-            # Create directories for LLaMA with proper permissions
-            RUN mkdir -p /models /app/metrics /app/ray_serve && \
-                chmod -R 777 /models /app
-                
-            # Create lib directory
-            RUN mkdir -p /usr/local/lib /usr/local/bin
-            
-            # Instead of building, download pre-built llama-server binary
-            # This is an example - replace with a real binary URL or skip if not available
-            RUN apt-get update && apt-get install -y --no-install-recommends \
-                curl \
-                ca-certificates \
-                && rm -rf /var/lib/apt/lists/*
-            
-            # Copy the metrics exporter script and Ray serve script
-            COPY metrics/exporter.py /app/metrics/exporter.py
-            RUN chmod +x /app/metrics/exporter.py
-            COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
-            
-            # Set working directory
-            WORKDIR /app/ray_serve
-            
-            # Command to run Ray Serve
-            CMD ["python", "-m", "ray", "start", "--head", "--port=6379", "--dashboard-host=0.0.0.0", "--dashboard-port=8265", "--block", "&", "python", "llama_serve.py"]
-            EOF
-            
-            if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-                # For actual pushes, build and push to Docker Hub
-                docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray.tmp .
-                docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG}
-            else
-                # For PRs, just build locally
-                docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray.tmp .
-            fi
+          # Always build locally for KIND
+          echo "Building LLaMA server image locally for KIND..."
+          docker build -t llama-server:latest .
+          
+          # Also tag with registry info for reference
+          docker tag llama-server:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:local
+          
+          # Only push to registry if not a PR
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "Pushing image to Docker Hub..."
+            docker tag llama-server:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}
+            docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}
+          fi
+          
+          echo "IMAGE_TAG=latest" >> $GITHUB_ENV
+
+      # Build Ray image locally - ADD THIS HERE
+      - name: Build Ray image locally
+        run: |
+          # Create a simplified Python-based Dockerfile for Ray
+          cat > Dockerfile.ray.tmp << 'EOF'
+          FROM python:3.9-slim
+
+          # Install Ray and other dependencies
+          RUN pip install ray[serve]==2.9.0 prometheus-client requests psutil
+
+          # Create directories
+          RUN mkdir -p /models /app/metrics /app/ray_serve && \
+              chmod -R 777 /models /app
+
+          # Copy application files
+          COPY metrics/exporter.py /app/metrics/exporter.py
+          COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
+          RUN chmod +x /app/metrics/exporter.py
+
+          # Set working directory
+          WORKDIR /app/ray_serve
+
+          # Default command
+          CMD ["python", "-m", "ray.serve", "run", "llama_serve:app"]
+          EOF
+          
+          # Build Ray image locally
+          echo "Building Ray image locally..."
+          docker build -t llama-ray:latest -f Dockerfile.ray.tmp .
+          
+          # Tag for registry reference
+          docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:local-ray
+          
+          # Only push to registry if not a PR
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "Pushing Ray image to Docker Hub..."
+            docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray
+            docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray
+          fi
+          
+          echo "RAY_TAG=latest" >> $GITHUB_ENV
 
       # Install kubectl and kind
       - name: Install kubectl
@@ -460,6 +459,20 @@ jobs:
           
           kubectl get nodes
           kubectl get storageclass
+
+      # Load Docker images to KIND - ADD THIS UPDATED VERSION HERE 
+      - name: Load Docker images to KIND
+        run: |
+          echo "Available Docker images:"
+          docker images
+          
+          echo "Loading images into KIND cluster..."
+          kind load docker-image llama-server:latest --name llama-cluster
+          kind load docker-image llama-ray:latest --name llama-cluster
+          
+          # Verify images are loaded
+          echo "Images in KIND cluster:"
+          docker exec llama-cluster-control-plane crictl images
 
       - name: Install Helm
         uses: azure/setup-helm@v3
@@ -803,30 +816,6 @@ jobs:
           echo "Monitoring services:"
           kubectl -n monitoring get services
 
-      # Load Docker images to KIND
-      - name: Load Docker images to KIND
-        run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            # For PRs, use locally built images
-            echo "Using locally built images for pull request..."
-            VERSION="pr-${{ github.event.pull_request.number || 'local' }}"
-            
-            # Build local images if they don't exist
-            docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}
-            docker tag ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ env.RAY_TAG }} ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${VERSION}-ray
-          else
-            # For non-PRs, use the versioned images we pushed
-            VERSION="${{ steps.meta.outputs.version || 'latest' }}"
-          fi
-          
-          echo "Loading images into KIND cluster..."
-          kind load docker-image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} --name llama-cluster
-          kind load docker-image ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ env.RAY_TAG }} --name llama-cluster
-          
-          echo "IMAGE_VERSION=${VERSION}" >> $GITHUB_ENV
-          echo "Loaded images:"
-          docker images | grep llama
-
       # Install KubeRay Operator
       - name: Install KubeRay Operator
         run: |
@@ -842,34 +831,8 @@ jobs:
           kubectl -n ray-system get pods
           kubectl get crds | grep ray.io
 
-      # Add this step after installing the KubeRay operator
-      - name: Deploy with KubeRay
-        run: |
-          # Make the script executable
-          chmod +x scripts/deploy-kuberay.sh
-
-          # Deploy using the script
-          ./scripts/deploy-kuberay.sh ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }} ${{ env.RAY_TAG }}
-
-          # Wait for deployment
-          echo "Waiting for Ray Cluster to be ready..."
-          kubectl -n llama wait --for=condition=established --timeout=5m \
-            crd/rayclusters.ray.io \
-            crd/rayservices.ray.io
-          
-          kubectl -n llama wait --for=condition=ready --timeout=5m rayservice/llama-ray-service || true
-          
-          # Show deployment status
-          echo "Ray Service status:"
-          kubectl -n llama get rayservice
-          
-          echo "Ray Cluster status:"
-          kubectl -n llama get raycluster
-          
-          echo "Ray Pods:"
-          kubectl -n llama get pods -l ray.io/cluster=llama-ray-cluster 
-          # Deploy LLaMA with Helm and KubeRay
-      - name: Deploy LLaMA with Helm
+      # Deploy LLaMA with Helm and KubeRay - COMBINE BOTH DEPLOY STEPS HERE
+      - name: Deploy LLaMA with Helm and KubeRay
         run: |
           # Create llama namespace
           kubectl create namespace llama --dry-run=client -o yaml | kubectl apply -f -
@@ -926,3 +889,24 @@ jobs:
                     mountPath: /models
                 volumes:
                 - name: dummy-model
+                  configMap:
+                    name: dummy-model
+                - name: models
+                  persistentVolumeClaim:
+                    claimName: llama-models
+                restartPolicy: Never
+          EOF
+          
+          # Wait for job completion
+          echo "Waiting for model setup job to complete..."
+          kubectl -n llama wait --for=condition=complete --timeout=60s job/model-setup || true
+          
+          # Create the Ray cluster
+          cat <<EOF | kubectl apply -f -
+          apiVersion: ray.io/v1
+          kind: RayCluster
+          metadata:
+            name: llama-ray-cluster
+            namespace: llama
+          spec:
+            rayVersion: '2.9.0'
