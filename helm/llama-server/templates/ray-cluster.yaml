@@ -3,74 +3,61 @@ apiVersion: ray.io/v1
 kind: RayCluster
 metadata:
   name: {{ .Values.ray.cluster.name | default (printf "%s-ray-cluster" (include "llama-server.fullname" .)) }}
-  namespace: {{ .Values.ray.cluster.namespace | default .Release.Namespace }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "llama-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ray-cluster
 spec:
   rayVersion: {{ .Values.ray.version | quote }}
   headGroupSpec:
     rayStartParams:
       dashboard-host: '0.0.0.0'
+      dashboard-port: '8265'
+      port: '6379'
       block: 'true'
-    replicas: {{ .Values.ray.cluster.head.replicas }}
-    serviceAccountName: {{ .Values.ray.cluster.head.serviceAccount }}
-    enableInTreeAutoscaling: {{ .Values.ray.cluster.head.enableInTreeAutoscaling }}
     template:
       spec:
         containers:
-        - name: ray-head
-          image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-          {{- range .Values.ray.cluster.head.ports }}
-            - containerPort: {{ .containerPort }}
-              name: {{ .name }}
-              {{- if .hostPort }}
-              hostPort: {{ .hostPort }}
-              {{- end }}
-          {{- end }}
-          resources:
-            {{- toYaml .Values.ray.cluster.head.resources | nindent 12 }}
-          volumeMounts:
-          {{- range .Values.ray.cluster.head.volumeMounts }}
-            - name: {{ .name }}
-              mountPath: {{ .mountPath }}
-          {{- end }}
+          - name: ray-head
+            image: {{ .Values.ray.image.repository }}:{{ .Values.ray.image.tag }}
+            imagePullPolicy: {{ .Values.ray.image.pullPolicy }}
+            ports:
+              - containerPort: 6379
+                name: gcs
+              - containerPort: 8265
+                name: dashboard
+              - containerPort: 10001
+                name: client
+              - containerPort: 8000
+                name: serve
+            resources:
+              {{- toYaml .Values.ray.headResources | nindent 14 }}
+            volumeMounts:
+              - name: models
+                mountPath: /models
         volumes:
-        {{- range .Values.ray.cluster.head.volumeMounts }}
-          - name: {{ .name }}
-            {{- if eq .name "models" }}
+          - name: models
             persistentVolumeClaim:
-              claimName: {{ $.Values.persistence.name | default (printf "%s-models" (include "llama-server.fullname" $)) }}
-            {{- end }}
-        {{- end }}
+              claimName: {{ .Values.persistence.name | default (printf "%s-models" (include "llama-server.fullname" .)) }}
   workerGroupSpecs:
-  {{- range .Values.ray.cluster.worker.groups }}
-    - groupName: {{ .name }}
-      replicas: {{ .replicas }}
-      minReplicas: {{ .minReplicas }}
-      maxReplicas: {{ .maxReplicas }}
+    - groupName: small-workers
+      replicas: {{ .Values.ray.workers.replicas }}
+      minReplicas: {{ .Values.ray.workers.minReplicas }}
+      maxReplicas: {{ .Values.ray.workers.maxReplicas }}
       rayStartParams: {}
       template:
         spec:
           containers:
-          - name: ray-worker
-            image: {{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}
-            imagePullPolicy: {{ $.Values.image.pullPolicy }}
-            resources:
-              {{- toYaml .resources | nindent 14 }}
-            volumeMounts:
-            {{- range .volumeMounts }}
-              - name: {{ .name }}
-                mountPath: {{ .mountPath }}
-            {{- end }}
+            - name: ray-worker
+              image: {{ .Values.ray.image.repository }}:{{ .Values.ray.image.tag }}
+              imagePullPolicy: {{ .Values.ray.image.pullPolicy }}
+              resources:
+                {{- toYaml .Values.ray.workerResources | nindent 16 }}
+              volumeMounts:
+                - name: models
+                  mountPath: /models
           volumes:
-          {{- range .volumeMounts }}
-            - name: {{ .name }}
-              {{- if eq .name "models" }}
+            - name: models
               persistentVolumeClaim:
-                claimName: {{ $.Values.persistence.name | default (printf "%s-models" (include "llama-server.fullname" $)) }}
-              {{- end }}
-          {{- end }}
-  {{- end }}
+                claimName: {{ .Values.persistence.name | default (printf "%s-models" (include "llama-server.fullname" .)) }}
 {{- end }}

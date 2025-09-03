@@ -1,41 +1,116 @@
-{{- if and .Values.ray.enabled .Values.rayService.enabled }}
+{{- if .Values.ray.enabled }}
+{{- if .Values.ray.service.enabled }}
+# Check for API compatibility based on Chart values
+{{- if eq .Values.ray.service.apiVersion "v1alpha1" }}
+# Legacy RayService format (0.3.0 and below)
+apiVersion: ray.io/v1alpha1
+kind: RayService
+metadata:
+  name: {{ .Values.ray.service.name | default (printf "%s-ray-service" (include "llama-server.fullname" .)) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "llama-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ray-service
+spec:
+  serveConfigV1:
+    importPath: {{ .Values.ray.service.importPath }}
+    deployments:
+      - name: LlamaDeployment
+        numReplicas: {{ .Values.ray.service.numReplicas }}
+        rayActorOptions:
+          numCpus: {{ .Values.ray.service.cpuPerReplica }}
+  rayClusterConfig:
+    headGroupSpecs: {}
+{{- else if eq .Values.ray.service.apiVersion "v1-deploymentgraph" }}
+# Mid-version RayService format (0.4.0 - 0.5.0)
 apiVersion: ray.io/v1
 kind: RayService
 metadata:
-  name: {{ .Values.rayService.name | default (printf "%s-ray-service" (include "llama-server.fullname" .)) }}
-  namespace: {{ .Values.rayService.namespace | default .Release.Namespace }}
+  name: {{ .Values.ray.service.name | default (printf "%s-ray-service" (include "llama-server.fullname" .)) }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "llama-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ray-service
+spec:
+  serviceUnhealthySecondThreshold: 300
+  serveDeploymentGraphSpec:
+    importPath: {{ .Values.ray.service.importPath }}
+    runtime: "env"
+    workingDir: "/app/ray_serve"
+  rayClusterSpec:
+    rayVersion: {{ .Values.ray.version | quote }}
+    headGroupSpec:
+      rayStartParams:
+        dashboard-host: '0.0.0.0'
+        dashboard-port: '8265'
+      template:
+        spec:
+          containers:
+            - name: ray-head
+              image: {{ .Values.ray.image.repository }}:{{ .Values.ray.image.tag }}
+{{- else }}
+# Modern RayService format (0.6.0+)
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: {{ .Values.ray.service.name | default (printf "%s-ray-service" (include "llama-server.fullname" .)) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "llama-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ray-service
 spec:
   rayClusterName: {{ .Values.ray.cluster.name | default (printf "%s-ray-cluster" (include "llama-server.fullname" .)) }}
   serveConfigV2:
-    importPath: {{ .Values.rayService.serveConfig.importPath }}
+    importPath: {{ .Values.ray.service.importPath }}
     runtimeEnv:
-      workingDir: {{ .Values.rayService.serveConfig.runtimeEnv.workingDir }}
-      {{- if .Values.rayService.serveConfig.runtimeEnv.pip }}
+      workingDir: /app/ray_serve
+      {{- if .Values.ray.service.pip }}
       pip:
-        {{- toYaml .Values.rayService.serveConfig.runtimeEnv.pip | nindent 8 }}
+        {{- toYaml .Values.ray.service.pip | nindent 8 }}
       {{- end }}
     deployments:
-    {{- range .Values.rayService.serveConfig.deployments }}
-      - name: {{ .name }}
-        numReplicas: {{ .numReplicas }}
-        {{- if .userConfig }}
+      - name: LlamaDeployment
+        numReplicas: {{ .Values.ray.service.numReplicas }}
+        {{- if .Values.ray.service.userConfig }}
         userConfig: 
-          {{- toYaml .userConfig | nindent 10 }}
+          {{- toYaml .Values.ray.service.userConfig | nindent 10 }}
         {{- end }}
         rayActorOptions:
-          numCpus: {{ .rayActorOptions.numCpus }}
-          numGpus: {{ .rayActorOptions.numGpus }}
-          {{- if .rayActorOptions.resources }}
-          resources:
-            {{- toYaml .rayActorOptions.resources | nindent 12 }}
+          numCpus: {{ .Values.ray.service.cpuPerReplica }}
+          {{- if .Values.ray.service.gpuPerReplica }}
+          numGpus: {{ .Values.ray.service.gpuPerReplica }}
           {{- end }}
-    {{- end }}
   service:
-    type: {{ .Values.rayService.service.type }}
-    port: {{ .Values.rayService.service.port }}
-    {{- if and (eq .Values.rayService.service.type "NodePort") .Values.rayService.service.nodePort }}
-    nodePort: {{ .Values.rayService.service.nodePort }}
+    type: {{ .Values.ray.service.type }}
+    port: {{ .Values.ray.service.port }}
+    {{- if eq .Values.ray.service.type "NodePort" }}
+    nodePort: {{ .Values.ray.service.nodePort }}
     {{- end }}
+{{- end }}
+{{- else }}
+# Fallback Kubernetes Service when RayService isn't enabled
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.ray.service.name | default (printf "%s-ray-service" (include "llama-server.fullname" .)) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "llama-server.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ray-service
+spec:
+  selector:
+    ray.io/node-type: head
+    ray.io/cluster: {{ .Values.ray.cluster.name | default (printf "%s-ray-cluster" (include "llama-server.fullname" .)) }}
+  ports:
+  - name: serve
+    port: {{ .Values.ray.service.port }}
+    targetPort: 8000
+    {{- if eq .Values.ray.service.type "NodePort" }}
+    nodePort: {{ .Values.ray.service.nodePort }}
+    {{- end }}
+  - name: dashboard
+    port: 8265
+    targetPort: 8265
+  type: {{ .Values.ray.service.type }}
+{{- end }}
 {{- end }}

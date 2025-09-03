@@ -1,96 +1,49 @@
-# KubeRay-specific values for llama-server
-nameOverride: ""
-fullnameOverride: "llama-kuberay"
-
-# Standard image config
-image:
-  repository: obike007/llama-ray
-  tag: latest
-  pullPolicy: IfNotPresent
-
-# Ray Cluster Configuration
+# Add this to your existing values.yaml
 ray:
   enabled: true
   version: "2.9.0"
   cluster:
     name: "llama-ray-cluster"
-    namespace: "llama"
-    headServiceType: ClusterIP
-    enableIngress: false
-    head:
-      serviceAccount: default
-      replicas: 1
-      enableInTreeAutoscaling: false
-      resources:
-        limits:
-          cpu: 2
-          memory: 4Gi
-        requests:
-          cpu: 1
-          memory: 2Gi
-      ports:
-        - name: gcs
-          containerPort: 6379
-          hostPort: 6379
-        - name: dashboard
-          containerPort: 8265
-          hostPort: 8265
-        - name: client
-          containerPort: 10001
-          hostPort: 10001
-      volumeMounts:
-        - name: models
-          mountPath: /models
-    worker:
-      groups:
-        - name: small-workers
-          replicas: 2
-          minReplicas: 1
-          maxReplicas: 5
-          resources:
-            limits:
-              cpu: 1
-              memory: 2Gi
-            requests:
-              cpu: 500m
-              memory: 1Gi
-          volumeMounts:
-            - name: models
-              mountPath: /models
-
-# Ray Service Configuration
-rayService:
-  enabled: true
-  name: "llama-ray-service"
-  namespace: "llama"
-  serveConfig:
-    importPath: app:app
-    runtimeEnv:
-      workingDir: /app/ray_serve
-      pip: []
-    deployments:
-      - name: LlamaDeployment
-        numReplicas: 2
-        userConfig: {}
-        rayActorOptions:
-          numCpus: 1
-          numGpus: 0
+  image:
+    repository: "llama-ray"  # Will be overridden in CI/CD
+    tag: "latest"           # Will be overridden in CI/CD
+    pullPolicy: "IfNotPresent"
+  headResources:
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+  workerResources:
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+  workers:
+    replicas: 1
+    minReplicas: 0
+    maxReplicas: 3
   service:
-    type: NodePort
+    enabled: true
+    apiVersion: "v1"  # Set this to match your KubeRay version: "v1alpha1", "v1-deploymentgraph", or "v1"
+    name: "llama-ray-service"
+    importPath: "llama_serve:app"
+    numReplicas: 1
+    cpuPerReplica: 1
+    gpuPerReplica: 0
+    type: "NodePort"
     port: 8000
     nodePort: 30085
+    pip: []
+    userConfig: {}
 
-# Persistence Configuration
+# Ensure your persistence settings are correct
 persistence:
   enabled: true
-  name: llama-models
-  mountPath: /models
-  size: 1Gi
-  storageClass: standard
-
-# Prometheus ServiceMonitor
-serviceMonitor:
-  enabled: true
-  namespace: monitoring
-  labels:
-    release: prometheus
+  name: "llama-models"
+  size: "100Mi"
+  mountPath: "/models"
+  storageClass: "standard"

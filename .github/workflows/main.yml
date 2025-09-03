@@ -23,12 +23,44 @@ jobs:
       id-token: write
 
     steps:
+      #####################################
+      # Setup Environment & Prerequisites #
+      #####################################
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.12.3'
+
+      - name: Install Kind
+        uses: helm/kind-action@v1.8.0
+        with:
+          install_only: true
+
+      #####################################
+      # Prepare Application Files         #
+      #####################################
       - name: Prepare directory structure
         run: |
-          mkdir -p metrics configs ray_serve
+          mkdir -p metrics configs ray_serve scripts
 
           # Create metrics exporter script
           cat > metrics/exporter.py << 'EOF'
@@ -315,23 +347,65 @@ jobs:
 
           app = DAGDriver.bind(deployment, input_node)
           EOF
+          
+          # Create test script
+          cat > scripts/test-ray-service.py << 'EOF'
+          #!/usr/bin/env python3
+          import requests
+          import json
+          import time
+          import sys
+
+          def test_ray_service(url):
+              """Test the Ray service by checking health endpoint and sending a test prompt."""
+              # Wait a bit for service to be fully ready
+              print(f"Testing Ray service at {url}")
+              
+              # Try to connect
+              max_retries = 10
+              for i in range(max_retries):
+                  try:
+                      response = requests.get(f"{url}/health", timeout=5)
+                      print(f"Health check status: {response.status_code}")
+                      if response.status_code == 200:
+                          print(f"Response: {json.dumps(response.json(), indent=2)}")
+                          
+                          # Test with a simple prompt
+                          prompt_data = {
+                              "prompt": "Hello, my name is",
+                              "n_predict": 10
+                          }
+                          
+                          print("Sending test prompt...")
+                          resp = requests.post(url, json=prompt_data, timeout=30)
+                          print(f"Prompt response status: {resp.status_code}")
+                          
+                          if resp.status_code == 200:
+                              print(f"Success! Response: {json.dumps(resp.json(), indent=2)}")
+                              return True
+                      
+                      print(f"Attempt {i+1}/{max_retries} - Service not ready yet, retrying...")
+                      time.sleep(10)
+                  except Exception as e:
+                      print(f"Error connecting to service: {e}")
+                      time.sleep(5)
+              
+              print("Ray service test failed")
+              return False
+
+          if __name__ == "__main__":
+              service_url = "http://localhost:30085"
+              if len(sys.argv) > 1:
+                  service_url = sys.argv[1]
+              
+              success = test_ray_service(service_url)
+              if not success:
+                  sys.exit(1)
+          EOF
 
           # Make scripts executable
-          chmod +x metrics/exporter.py
+          chmod +x metrics/exporter.py scripts/test-ray-service.py
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # Docker Hub login using secrets
-      - name: Log into Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-
-      # Extract metadata for the Docker image
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -343,200 +417,9 @@ jobs:
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
 
-      # This replaces your "Build standard LLaMA server image locally" step
-      - name: Build standard LLaMA server image locally
-        run: |
-          # Always build locally for KIND
-          echo "Building LLaMA server image locally for KIND..."
-          docker build -t llama-server:latest .
-          # Only push to registry if not a PR
-          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-            docker tag llama-server:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}
-            
-            # Try pushing with retry and continue on failure
-            MAX_RETRIES=3
-            RETRY_COUNT=0
-            SLEEP_TIME=10
-            
-            until [ $RETRY_COUNT -ge $MAX_RETRIES ]
-            do
-            echo "Attempt $((RETRY_COUNT+1)) to push image to Docker Hub..."
-            
-            if docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}; then
-                echo "Successfully pushed image to Docker Hub"
-                break
-            else
-                RETRY_COUNT=$((RETRY_COUNT+1))
-                
-                if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
-                echo "Failed to push to Docker Hub after $MAX_RETRIES attempts, continuing workflow..."
-                break
-                fi
-                
-                SLEEP_TIME=$((SLEEP_TIME * 2))
-                echo "Push failed. Retrying in $SLEEP_TIME seconds..."
-                sleep $SLEEP_TIME
-            fi
-            done
-            fi
-        
-            echo "IMAGE_TAG=latest" >> $GITHUB_ENV
-
-      - name: Build Ray image with essential features
-        run: |
-          cat > Dockerfile.ray << 'EOF'
-          FROM python:3.9-slim
-          # System dependencies for Ray
-          RUN apt-get update && apt-get install -y --no-install-recommends \
-              build-essential \
-              curl \
-              psmisc \
-              wget \
-              vim \
-              git \
-              rsync \
-              netcat \
-              iproute2 \
-              && rm -rf /var/lib/apt/lists/*
-
-          # Install Ray with all necessary components
-          RUN pip install --no-cache-dir \
-              "ray[serve,tune,train,data,air]==2.9.0" \
-              prometheus-client \
-              requests \
-              psutil \
-              numpy \
-              pandas \
-              scikit-learn \
-              torch \
-              fastapi \
-              uvicorn
-
-          # Create directories for LLaMA and Ray
-          RUN mkdir -p /models /app/metrics /app/ray_serve /tmp/ray && \
-              chmod -R 777 /models /app /tmp/ray
-
-          # Configure Ray system parameters
-          RUN echo "* soft nofile 65536" >> /etc/security/limits.conf && \
-              echo "* hard nofile 65536" >> /etc/security/limits.conf && \
-              echo "fs.file-max=65536" >> /etc/sysctl.conf
-
-          # Copy application files
-          COPY metrics/exporter.py /app/metrics/exporter.py
-          COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
-          RUN chmod +x /app/metrics/exporter.py
-
-          # Set working directory
-          WORKDIR /app/ray_serve
-
-          # Create entrypoint script to properly start Ray
-          RUN cat > /app/ray_serve/start.sh << 'ENTRYPOINT'
-          #!/bin/bash
-          # Start Ray head node
-          ray start --head \
-              --port=6379 \
-              --dashboard-host=0.0.0.0 \
-              --dashboard-port=8265 \
-              --num-cpus="${RAY_NUM_CPUS:-1}" \
-              --block &
-          
-          # Wait for Ray to start up
-          sleep 5
-          
-          # Start Ray Serve application
-          python -m ray.serve run llama_serve:app
-          
-          # Keep container running
-          tail -f /dev/null
-          ENTRYPOINT
-          RUN chmod +x /app/ray_serve/start.sh
-
-          # Environment variables
-          ENV RAY_NUM_CPUS=1
-          ENV RAY_OBJECT_STORE_MEMORY=1000000000
-          ENV RAY_memory_monitor_refresh_ms=0
-          ENV RAY_dashboard_agent_listen_port=52365
-
-          # Expose ports
-          EXPOSE 6379 8265 8000 10001 52365
-
-          # Default command
-          CMD ["./start.sh"]
-          EOF
-          
-    # Build Ray image locally with proper permissions
-      - name: Build Ray image locally
-        run: |
-          # Create a simplified Python-based Dockerfile for Ray
-          cat > Dockerfile.ray.tmp << 'EOF'
-          # Start with Python image to avoid permission issues
-          FROM python:3.9-slim
-          
-          # Install Ray and other dependencies
-          RUN pip install --no-cache-dir "ray[serve]==2.9.0" prometheus-client requests psutil
-          
-          # Create directories
-          RUN mkdir -p /models /app/metrics /app/ray_serve && \
-              chmod -R 777 /models /app
-          
-          # Copy application files
-          COPY metrics/exporter.py /app/metrics/exporter.py
-          COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
-          RUN chmod +x /app/metrics/exporter.py
-          
-          # Create convenient entry script
-          RUN echo '#!/bin/bash\n\
-          echo "Starting Ray server..."\n\
-          python -m ray.serve run llama_serve:app\n\
-          ' > /app/ray_serve/start.sh && chmod +x /app/ray_serve/start.sh
-          
-          # Set working directory
-          WORKDIR /app/ray_serve
-          
-          # Default command
-          CMD ["./start.sh"]
-          EOF
-          
-          # Display the Dockerfile for debugging
-          echo "=== Dockerfile.ray.tmp ==="
-          cat Dockerfile.ray.tmp
-          echo "=========================="
-          
-          # Build Ray image locally
-          echo "Building Ray image locally..."
-          docker build -t llama-ray:latest -f Dockerfile.ray.tmp .
-          
-          # Verify the build succeeded
-          if [ $? -eq 0 ]; then
-            echo "Ray image built successfully"
-            
-            # Tag for registry reference
-            docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:local-ray
-            
-            # Only push to registry if not a PR
-            if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-              echo "Pushing Ray image to Docker Hub..."
-              docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray
-              docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray || echo "Failed to push to Docker Hub, continuing..."
-            fi
-          else
-            echo "Ray image build failed"
-            exit 1
-          fi
-          
-          echo "RAY_TAG=latest" >> $GITHUB_ENV
-          
-        # Rest of your build process...
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v3
-        with:
-          version: 'v1.28.0'
-
-      - name: Install Kind
-        uses: helm/kind-action@v1.8.0
-        with:
-          install_only: true
-
+      ####################################
+      # Create Kind Cluster              #
+      ####################################
       - name: Create Kind cluster
         run: |
           cat > kind-config.yaml << EOF
@@ -582,7 +465,90 @@ jobs:
           kubectl get nodes
           kubectl get storageclass
 
-      # Load Docker images to KIND - ADD THIS UPDATED VERSION HERE 
+      ####################################
+      # Build and Load Docker Images     #
+      ####################################
+      - name: Build LLaMA server image
+        run: |
+          # Build locally for KIND
+          echo "Building LLaMA server image locally for KIND..."
+          docker build -t llama-server:latest .
+          
+          # Only push to registry if not a PR
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            docker tag llama-server:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}
+            
+            # Try pushing with retry and continue on failure
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            SLEEP_TIME=10
+            
+            until [ $RETRY_COUNT -ge $MAX_RETRIES ]
+            do
+              echo "Attempt $((RETRY_COUNT+1)) to push image to Docker Hub..."
+              
+              if docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}; then
+                echo "Successfully pushed image to Docker Hub"
+                break
+              else
+                RETRY_COUNT=$((RETRY_COUNT+1))
+                
+                if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+                  echo "Failed to push to Docker Hub after $MAX_RETRIES attempts, continuing workflow..."
+                  break
+                fi
+                
+                SLEEP_TIME=$((SLEEP_TIME * 2))
+                echo "Push failed. Retrying in $SLEEP_TIME seconds..."
+                sleep $SLEEP_TIME
+              fi
+            done
+          fi
+          
+          echo "IMAGE_TAG=latest" >> $GITHUB_ENV
+
+      - name: Build Ray image
+        run: |
+          # Create a simplified Python-based Dockerfile for Ray
+          cat > Dockerfile.ray << 'EOF'
+          # Start with Python image to avoid permission issues
+          FROM python:3.9-slim
+          
+          # Install Ray and other dependencies
+          RUN pip install --no-cache-dir "ray[serve]==2.9.0" prometheus-client requests psutil numpy pandas fastapi uvicorn
+          
+          # Create directories
+          RUN mkdir -p /models /app/metrics /app/ray_serve && \
+              chmod -R 777 /models /app
+          
+          # Copy application files
+          COPY metrics/exporter.py /app/metrics/exporter.py
+          COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
+          RUN chmod +x /app/metrics/exporter.py
+          
+          # Set working directory
+          WORKDIR /app/ray_serve
+          
+          # Default command
+          CMD ["python", "-m", "ray.serve", "run", "llama_serve:app"]
+          EOF
+          
+          # Build Ray image locally
+          echo "Building Ray image locally..."
+          docker build -t llama-ray:latest -f Dockerfile.ray .
+          
+          # Tag for registry reference
+          docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:local-ray
+          
+          # Only push to registry if not a PR
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "Pushing Ray image to Docker Hub..."
+            docker tag llama-ray:latest ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray
+            docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }}-ray || echo "Failed to push Ray image, continuing..."
+          fi
+          
+          echo "RAY_TAG=latest" >> $GITHUB_ENV
+
       - name: Load Docker images to KIND
         run: |
           echo "Available Docker images:"
@@ -596,20 +562,16 @@ jobs:
           echo "Images in KIND cluster:"
           docker exec llama-cluster-control-plane crictl images
 
-      - name: Install Helm
-        uses: azure/setup-helm@v3
-        with:
-          version: 'v3.12.3'
-
-      # Add Helm repos
+      ####################################
+      # Set Up Monitoring & KubeRay      #
+      ####################################
       - name: Add Helm repositories
         run: |
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo add kuberay https://ray-project.github.io/kuberay-helm/
           helm repo update
 
-      # Deploy monitoring stack
-      - name: Deploy monitoring
+      - name: Deploy monitoring stack
         run: |
           # Create monitoring namespace
           kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
@@ -938,195 +900,7 @@ jobs:
           echo "Monitoring services:"
           kubectl -n monitoring get services
 
-      # Install KubeRay Operator
       - name: Install KubeRay Operator
         run: |
           # Create namespace for KubeRay
-          kubectl create namespace ray-system --dry-run=client -o yaml | kubectl apply -f -
-          
-          # Install KubeRay operator
-          helm install kuberay-operator kuberay/kuberay-operator \
-            --namespace ray-system \
-            --wait
-          
-          echo "Verifying KubeRay operator installation:"
-          kubectl -n ray-system get pods
-          kubectl get crds | grep ray.io
-
-      - name: Deploy Ray Cluster and Service
-        run: |
-            # Create llama namespace
-            kubectl create namespace llama --dry-run=client -o yaml | kubectl apply -f -
-            
-            # Create small dummy model for testing
-            cat <<EOF | kubectl apply -f -
-            apiVersion: v1
-            kind: ConfigMap
-            metadata:
-              name: dummy-model
-              namespace: llama
-            data:
-              model.gguf: |
-                DUMMY_MODEL_DATA_FOR_TESTING_ONLY
-            EOF
-            
-            # Create PVC for models
-            cat <<EOF | kubectl apply -f -
-            apiVersion: v1
-            kind: PersistentVolumeClaim
-            metadata:
-              name: llama-models
-              namespace: llama
-            spec:
-              accessModes:
-                - ReadWriteOnce
-              resources:
-                requests:
-                  storage: 100Mi
-            EOF
-            
-            # Wait for PVC to be created (no -Ready condition for PVCs, so just sleep)
-            echo "Waiting for PVC to be provisioned..."
-            sleep 10
-            kubectl -n llama get pvc
-            
-            # Copy dummy model to PVC
-            cat <<EOF | kubectl apply -f -
-            apiVersion: batch/v1
-            kind: Job
-            metadata:
-              name: model-setup
-              namespace: llama
-            spec:
-              ttlSecondsAfterFinished: 100
-              template:
-                spec:
-                  containers:
-                  - name: model-setup
-                    image: busybox
-                    command: ["sh", "-c", "cp /dummy/model.gguf /models/model.gguf && echo 'Dummy model copied'"]
-                    volumeMounts:
-                    - name: dummy-model
-                      mountPath: /dummy
-                    - name: models
-                      mountPath: /models
-                  volumes:
-                  - name: dummy-model
-                    configMap:
-                      name: dummy-model
-                  - name: models
-                    persistentVolumeClaim:
-                      claimName: llama-models
-                  restartPolicy: Never
-            EOF
-            
-            # Wait for job completion
-            echo "Waiting for model setup job to complete..."
-            kubectl -n llama wait --for=condition=complete --timeout=60s job/model-setup || true
-            
-            # Create the Ray cluster - FIXED COMPLETE DEFINITION
-            cat <<EOF | kubectl apply -f -
-            apiVersion: ray.io/v1
-            kind: RayCluster
-            metadata:
-              name: llama-ray-cluster
-              namespace: llama
-            spec:
-              rayVersion: '2.9.0'
-              headGroupSpec:
-                rayStartParams:
-                  dashboard-host: '0.0.0.0'
-                  dashboard-port: '8265'
-                  port: '6379'
-                  block: 'true'
-                template:
-                  spec:
-                    containers:
-                      - name: ray-head
-                        image: llama-ray:latest
-                        imagePullPolicy: IfNotPresent
-                        ports:
-                          - containerPort: 6379
-                            name: gcs
-                          - containerPort: 8265
-                            name: dashboard
-                          - containerPort: 10001
-                            name: client
-                        resources:
-                          limits:
-                            cpu: "2"
-                            memory: "4Gi"
-                          requests:
-                            cpu: "1"
-                            memory: "2Gi"
-                        volumeMounts:
-                          - name: models
-                            mountPath: /models
-                    volumes:
-                      - name: models
-                        persistentVolumeClaim:
-                          claimName: llama-models
-              workerGroupSpecs:
-                - groupName: small-workers
-                  replicas: 1
-                  minReplicas: 0
-                  maxReplicas: 3
-                  rayStartParams: {}
-                  template:
-                    spec:
-                      containers:
-                        - name: ray-worker
-                          image: llama-ray:latest
-                          imagePullPolicy: IfNotPresent
-                          resources:
-                            limits:
-                              cpu: "1"
-                              memory: "2Gi"
-                            requests:
-                              cpu: "500m"
-                              memory: "1Gi"
-                          volumeMounts:
-                            - name: models
-                              mountPath: /models
-                      volumes:
-                        - name: models
-                          persistentVolumeClaim:
-                            claimName: llama-models
-            EOF
-            
-            # Create the Ray service
-            cat <<EOF | kubectl apply -f -
-            apiVersion: ray.io/v1
-            kind: RayService
-            metadata:
-              name: llama-ray-service
-              namespace: llama
-            spec:
-              rayClusterName: llama-ray-cluster
-              serveConfigV2:
-                importPath: llama_serve:app
-                runtimeEnv:
-                  workingDir: /app/ray_serve
-                  pip: []
-                deployments:
-                  - name: LlamaDeployment
-                    numReplicas: 1
-                    userConfig: {}
-                    rayActorOptions:
-                      numCpus: 1
-                      numGpus: 0
-              service:
-                type: NodePort
-                port: 8000
-                nodePort: 30085
-            EOF
-            
-            # Check deployment status
-            echo "RayCluster status:"
-            kubectl -n llama get raycluster
-            
-            echo "RayService status:"
-            kubectl -n llama get rayservice || echo "RayService not yet available"
-            
-            echo "Pods:"
-            kubectl -n llama get pods
+          kubectl create namespace ray-system --
