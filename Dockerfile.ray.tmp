@@ -1,60 +1,8 @@
-# Build and push Ray integration image
-- name: Build and push Ray integration image
-  run: |
-    # Set Ray image tag
-    RAY_TAG="${{ steps.meta.outputs.version || 'latest' }}-ray"
-    echo "RAY_TAG=$RAY_TAG" >> $GITHUB_ENV
-    
-    # Create a temporary Dockerfile for Ray image - FIXED VERSION
-    cat > Dockerfile.ray.tmp << EOF
-    # Stage 1: Extract from llama-server image
-    FROM ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} AS llama-image
-
-    # Stage 2: Build the Ray image
-    FROM rayproject/ray:2.9.0
-
-    # Install Python dependencies for LLaMA and metrics
-    RUN pip install prometheus-client requests psutil
-
-    # Create directories for LLaMA
-    RUN mkdir -p /models /app/metrics /app/ray_serve && \\
-        chmod -R 777 /models /app
-
-    # Copy the LLaMA server binary from the first stage
-    COPY --from=llama-image /usr/local/bin/llama-server /usr/local/bin/
-
-    # Create lib directory
-    RUN mkdir -p /usr/local/lib
-    
-    # Use RUN with shell commands instead of COPY with || true
-    # This handles the case where files might not exist
-    RUN if [ -d /usr/local/lib/ ] && [ -n "\$(ls -A /usr/local/lib/ 2>/dev/null)" ]; then \\
-          echo "Copying libraries from image..."; \\
-          cp -r /usr/local/lib/* /usr/local/lib/ 2>/dev/null || true; \\
-        else \\
-          echo "No libraries to copy or directory doesn't exist"; \\
-        fi
-        
-    RUN ldconfig
-
-    # Copy the metrics exporter script
-    COPY metrics/exporter.py /app/metrics/exporter.py
-    RUN chmod +x /app/metrics/exporter.py
-
-    # Copy Ray serve script
-    COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
-    EOF
-    
-    # Display the Dockerfile for debugging
-    echo "=== Generated Dockerfile.ray.tmp ==="
-    cat Dockerfile.ray.tmp
-    echo "=== End of Dockerfile ==="
-    
-    if [[ "${{ github.event_name }}" != "pull_request" ]]; then
-      # For actual pushes, build and push to Docker Hub
-      docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray.tmp .
-      docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG}
-    else
-      # For PRs, just build locally
-      docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray.tmp .
-    fi
+FROM rayproject/ray:2.9.0
+RUN pip install --no-cache-dir prometheus-client requests psutil
+RUN mkdir -p /models /app/metrics /app/ray_serve && chmod -R 777 /models /app
+COPY metrics/exporter.py /app/metrics/exporter.py
+COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
+RUN chmod +x /app/metrics/exporter.py
+WORKDIR /app/ray_serve
+CMD ["python", "-m", "ray.serve", "run", "llama_serve:app"]
