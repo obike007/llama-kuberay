@@ -1,5 +1,4 @@
-
-name: CI/CD Pipeline for LLaMA Server
+name: CI/CD Pipeline for LLaMA Server with KubeRay
 
 on:
   push:
@@ -13,6 +12,7 @@ env:
   # Configure for Docker Hub
   REGISTRY: docker.io
   IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server
+  RAY_IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/llama-ray
 
 jobs:
   build-and-deploy:
@@ -26,12 +26,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ADD THE NEW STEP HERE - after checkout, before Docker build
-      - name: Prepare Docker build context
+      - name: Prepare directory structure
         run: |
-          mkdir -p metrics configs
-          
-          # Create the exporter script
+          mkdir -p metrics configs ray_serve
+
+          # Create metrics exporter script
           cat > metrics/exporter.py << 'EOF'
           #!/usr/bin/env python3
           import time
@@ -198,8 +197,8 @@ jobs:
                   logger.error(f"Fatal error: {e}")
                   raise
           EOF
-          
-          # Create the supervisor config
+
+          # Create supervisor config
           cat > configs/supervisord.conf << 'EOF'
           [supervisord]
           nodaemon=true
@@ -232,13 +231,93 @@ jobs:
           priority=2
           startsecs=15
           EOF
-          
-          # Make exporter script executable
+
+          # Create Ray Serve script
+          cat > ray_serve/llama_serve.py << 'EOF'
+          import os
+          import subprocess
+          import time
+          import threading
+          from typing import Dict, Any
+
+          import ray
+          from ray import serve
+          from ray.serve.drivers import DAGDriver
+          from ray.serve.deployment_graph import InputNode
+          import requests
+
+          # Start the LLaMA server as a subprocess
+          def start_llama_server():
+              cmd = [
+                  "/usr/local/bin/llama-server",
+                  "-m", "/models/model.gguf",
+                  "-c", "2048",
+                  "--host", "0.0.0.0",
+                  "--port", "8084",
+                  "--slots",
+                  "--verbose"
+              ]
+              process = subprocess.Popen(cmd)
+              return process
+
+          # Start metrics exporter
+          def start_metrics_exporter():
+              cmd = ["python3", "/app/metrics/exporter.py"]
+              process = subprocess.Popen(cmd)
+              return process
+
+          @serve.deployment(
+              num_replicas=1,
+              ray_actor_options={"num_cpus": 1, "num_gpus": 0}
+          )
+          class LlamaDeployment:
+              def __init__(self):
+                  self.llama_process = start_llama_server()
+                  self.metrics_process = start_metrics_exporter()
+                  # Wait for the server to start
+                  self._wait_for_server()
+                  
+              def _wait_for_server(self, max_retries=30):
+                  for i in range(max_retries):
+                      try:
+                          response = requests.get("http://localhost:8084/health", timeout=2)
+                          if response.status_code == 200:
+                              print("LLaMA server is ready")
+                              return
+                      except:
+                          pass
+                      time.sleep(2)
+                      print(f"Waiting for LLaMA server... ({i+1}/{max_retries})")
+                  print("LLaMA server failed to start")
+              
+              async def __call__(self, request: Dict[str, Any]) -> Dict[str, Any]:
+                  # Forward the request to the LLaMA server
+                  try:
+                      response = requests.post(
+                          "http://localhost:8084/completion",
+                          json=request,
+                          timeout=60
+                      )
+                      return response.json()
+                  except Exception as e:
+                      return {"error": str(e)}
+              
+              def __del__(self):
+                  # Clean up processes when the deployment is terminated
+                  if hasattr(self, 'llama_process'):
+                      self.llama_process.terminate()
+                  if hasattr(self, 'metrics_process'):
+                      self.metrics_process.terminate()
+
+          # Create the service
+          with InputNode() as input_node:
+              deployment = LlamaDeployment.bind()
+
+          app = DAGDriver.bind(deployment, input_node)
+          EOF
+
+          # Make scripts executable
           chmod +x metrics/exporter.py
-          
-          # List files to verify
-          echo "Created files:"
-          find metrics configs -type f | sort
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -264,8 +343,8 @@ jobs:
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
 
-      # Build and push Docker image
-      - name: Build and push Docker image
+      # Build and push Docker image for LLaMA server
+      - name: Build and push LLaMA server image
         id: build-and-push
         uses: docker/build-push-action@v5
         with:
@@ -274,7 +353,566 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          no-cache: true  # Disable cache to avoid previous issues
+          no-cache: true
 
-      # Rest of your workflow...
-      # ...
+      # Build and push Ray integration image
+      - name: Build Ray integration image
+        run: |
+          # Create the Ray Dockerfile
+          cat > Dockerfile.ray << EOF
+          FROM rayproject/ray:2.9.0
+          
+          # Install Python dependencies for LLaMA and metrics
+          RUN pip install prometheus-client requests psutil
+          
+          # Create directories for LLaMA
+          RUN mkdir -p /models /app/metrics /app/ray_serve && \\
+              chmod -R 777 /models /app
+          
+          # Copy the LLaMA server binary and libraries
+          COPY --from=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} /usr/local/bin/llama-server /usr/local/bin/
+          COPY --from=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} /usr/local/lib/*.so /usr/local/lib/ 2>/dev/null || true
+          RUN ldconfig
+          
+          # Copy the metrics exporter script
+          COPY metrics/exporter.py /app/metrics/exporter.py
+          RUN chmod +x /app/metrics/exporter.py
+          
+          # Copy Ray serve script
+          COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
+          EOF
+          
+          # Set Ray image tag
+          RAY_TAG="${{ steps.meta.outputs.version || 'latest' }}-ray"
+          echo "RAY_TAG=$RAY_TAG" >> $GITHUB_ENV
+          
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            # For actual pushes, build and push to Docker Hub
+            docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray .
+            docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG}
+          else
+            # For PRs, just build locally
+            docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray .
+          fi
+
+      # Install kubectl and kind
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Install Kind
+        uses: helm/kind-action@v1.8.0
+        with:
+          install_only: true
+
+      - name: Create Kind cluster
+        run: |
+          cat > kind-config.yaml << EOF
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            extraPortMappings:
+            - containerPort: 30080
+              hostPort: 30080
+              protocol: TCP
+            - containerPort: 30090
+              hostPort: 30090
+              protocol: TCP
+            - containerPort: 30300
+              hostPort: 30300
+              protocol: TCP
+            - containerPort: 30900
+              hostPort: 30900
+              protocol: TCP
+            - containerPort: 30085
+              hostPort: 30085
+              protocol: TCP
+            - containerPort: 8265
+              hostPort: 8265
+              protocol: TCP
+          EOF
+
+          kind create cluster --name llama-cluster --config=kind-config.yaml
+          
+          # Create default StorageClass
+          kubectl apply -f - <<EOF
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: standard
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: rancher.io/local-path
+          volumeBindingMode: WaitForFirstConsumer
+          EOF
+          
+          kubectl get nodes
+          kubectl get storageclass
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.12.3'
+
+      # Add Helm repos
+      - name: Add Helm repositories
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add kuberay https://ray-project.github.io/kuberay-helm/
+          helm repo update
+
+      # Deploy monitoring stack
+      - name: Deploy monitoring
+        run: |
+          # Create monitoring namespace
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create simplified values for Prometheus
+          cat > monitoring/prometheus-values-ci.yaml << EOF
+          alertmanager:
+            enabled: false
+            
+          kubeStateMetrics:
+            enabled: true
+            
+          nodeExporter:
+            enabled: true
+            
+          prometheusOperator:
+            admissionWebhooks:
+              enabled: false
+            resources:
+              limits:
+                cpu: 100m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+                
+          prometheus:
+            enabled: true
+            service:
+              type: NodePort
+              nodePort: 30900
+            prometheusSpec:
+              serviceMonitorSelectorNilUsesHelmValues: false
+              serviceMonitorSelector: {}
+              serviceMonitorNamespaceSelector: {}
+              podMonitorSelectorNilUsesHelmValues: false
+              podMonitorSelector: {}
+              podMonitorNamespaceSelector: {}
+              retention: 1h
+              resources:
+                limits:
+                  cpu: 250m
+                  memory: 512Mi
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                  
+          grafana:
+            enabled: true
+            adminPassword: "admin"
+            service:
+              type: NodePort
+              nodePort: 30300
+            resources:
+              limits:
+                cpu: 100m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+            dashboards:
+              default:
+                ray-dashboard:
+                  json: >
+                    {
+                      "annotations": {
+                        "list": [
+                          {
+                            "builtIn": 1,
+                            "datasource": "-- Grafana --",
+                            "enable": true,
+                            "hide": true,
+                            "iconColor": "rgba(0, 211, 255, 1)",
+                            "name": "Annotations & Alerts",
+                            "type": "dashboard"
+                          }
+                        ]
+                      },
+                      "editable": true,
+                      "gnetId": null,
+                      "graphTooltip": 0,
+                      "id": 1,
+                      "links": [],
+                      "panels": [
+                        {
+                          "datasource": null,
+                          "fieldConfig": {
+                            "defaults": {
+                              "color": {
+                                "mode": "thresholds"
+                              },
+                              "mappings": [],
+                              "thresholds": {
+                                "mode": "absolute",
+                                "steps": [
+                                  {
+                                    "color": "red",
+                                    "value": null
+                                  },
+                                  {
+                                    "color": "green",
+                                    "value": 1
+                                  }
+                                ]
+                              }
+                            },
+                            "overrides": []
+                          },
+                          "gridPos": {
+                            "h": 6,
+                            "w": 6,
+                            "x": 0,
+                            "y": 0
+                          },
+                          "id": 2,
+                          "options": {
+                            "orientation": "auto",
+                            "reduceOptions": {
+                              "calcs": [
+                                "lastNotNull"
+                              ],
+                              "fields": "",
+                              "values": false
+                            },
+                            "showThresholdLabels": false,
+                            "showThresholdMarkers": true
+                          },
+                          "pluginVersion": "7.5.7",
+                          "targets": [
+                            {
+                              "exemplar": true,
+                              "expr": "up{job=\"ray\"}",
+                              "interval": "",
+                              "legendFormat": "",
+                              "refId": "A"
+                            }
+                          ],
+                          "title": "Ray Cluster Status",
+                          "type": "gauge"
+                        },
+                        {
+                          "datasource": null,
+                          "fieldConfig": {
+                            "defaults": {
+                              "color": {
+                                "mode": "palette-classic"
+                              },
+                              "custom": {
+                                "axisLabel": "",
+                                "axisPlacement": "auto",
+                                "barAlignment": 0,
+                                "drawStyle": "line",
+                                "fillOpacity": 10,
+                                "gradientMode": "none",
+                                "hideFrom": {
+                                  "legend": false,
+                                  "tooltip": false,
+                                  "viz": false
+                                },
+                                "lineInterpolation": "linear",
+                                "lineWidth": 1,
+                                "pointSize": 5,
+                                "scaleDistribution": {
+                                  "type": "linear"
+                                },
+                                "showPoints": "never",
+                                "spanNulls": true,
+                                "stacking": {
+                                  "group": "A",
+                                  "mode": "none"
+                                },
+                                "thresholdsStyle": {
+                                  "mode": "off"
+                                }
+                              },
+                              "mappings": [],
+                              "thresholds": {
+                                "mode": "absolute",
+                                "steps": [
+                                  {
+                                    "color": "green",
+                                    "value": null
+                                  }
+                                ]
+                              },
+                              "unit": "percentunit"
+                            },
+                            "overrides": []
+                          },
+                          "gridPos": {
+                            "h": 8,
+                            "w": 12,
+                            "x": 0,
+                            "y": 6
+                          },
+                          "id": 4,
+                          "options": {
+                            "legend": {
+                              "calcs": [],
+                              "displayMode": "list",
+                              "placement": "bottom"
+                            },
+                            "tooltip": {
+                              "mode": "single"
+                            }
+                          },
+                          "pluginVersion": "7.5.7",
+                          "targets": [
+                            {
+                              "exemplar": true,
+                              "expr": "rate(process_cpu_seconds_total{job=\"ray\"}[1m])",
+                              "interval": "",
+                              "legendFormat": "{{instance}}",
+                              "refId": "A"
+                            }
+                          ],
+                          "title": "CPU Usage",
+                          "type": "timeseries"
+                        },
+                        {
+                          "datasource": null,
+                          "fieldConfig": {
+                            "defaults": {
+                              "color": {
+                                "mode": "palette-classic"
+                              },
+                              "custom": {
+                                "axisLabel": "",
+                                "axisPlacement": "auto",
+                                "barAlignment": 0,
+                                "drawStyle": "line",
+                                "fillOpacity": 10,
+                                "gradientMode": "none",
+                                "hideFrom": {
+                                  "legend": false,
+                                  "tooltip": false,
+                                  "viz": false
+                                },
+                                "lineInterpolation": "linear",
+                                "lineWidth": 1,
+                                "pointSize": 5,
+                                "scaleDistribution": {
+                                  "type": "linear"
+                                },
+                                "showPoints": "never",
+                                "spanNulls": true,
+                                "stacking": {
+                                  "group": "A",
+                                  "mode": "none"
+                                },
+                                "thresholdsStyle": {
+                                  "mode": "off"
+                                }
+                              },
+                              "mappings": [],
+                              "thresholds": {
+                                "mode": "absolute",
+                                "steps": [
+                                  {
+                                    "color": "green",
+                                    "value": null
+                                  }
+                                ]
+                              },
+                              "unit": "bytes"
+                            },
+                            "overrides": []
+                          },
+                          "gridPos": {
+                            "h": 8,
+                            "w": 12,
+                            "x": 12,
+                            "y": 6
+                          },
+                          "id": 6,
+                          "options": {
+                            "legend": {
+                              "calcs": [],
+                              "displayMode": "list",
+                              "placement": "bottom"
+                            },
+                            "tooltip": {
+                              "mode": "single"
+                            }
+                          },
+                          "pluginVersion": "7.5.7",
+                          "targets": [
+                            {
+                              "exemplar": true,
+                              "expr": "process_resident_memory_bytes{job=\"ray\"}",
+                              "interval": "",
+                              "legendFormat": "{{instance}}",
+                              "refId": "A"
+                            }
+                          ],
+                          "title": "Memory Usage",
+                          "type": "timeseries"
+                        }
+                      ],
+                      "refresh": "10s",
+                      "schemaVersion": 27,
+                      "style": "dark",
+                      "tags": [],
+                      "templating": {
+                        "list": []
+                      },
+                      "time": {
+                        "from": "now-1h",
+                        "to": "now"
+                      },
+                      "timepicker": {},
+                      "timezone": "",
+                      "title": "Ray Dashboard",
+                      "uid": "ray-dashboard",
+                      "version": 1
+                    }
+          EOF
+          
+          # Install Prometheus Stack
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --values monitoring/prometheus-values-ci.yaml \
+            --timeout 5m \
+            --wait || echo "Prometheus installation may not be complete, continuing"
+          
+          echo "Monitoring services:"
+          kubectl -n monitoring get services
+
+      # Load Docker images to KIND
+      - name: Load Docker images to KIND
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # For PRs, use locally built images
+            echo "Using locally built images for pull request..."
+            VERSION="pr-${{ github.event.pull_request.number || 'local' }}"
+            
+            # Build local images if they don't exist
+            docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}
+            docker tag ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ env.RAY_TAG }} ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${VERSION}-ray
+          else
+            # For non-PRs, use the versioned images we pushed
+            VERSION="${{ steps.meta.outputs.version || 'latest' }}"
+          fi
+          
+          echo "Loading images into KIND cluster..."
+          kind load docker-image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} --name llama-cluster
+          kind load docker-image ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${{ env.RAY_TAG }} --name llama-cluster
+          
+          echo "IMAGE_VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "Loaded images:"
+          docker images | grep llama
+
+      # Install KubeRay Operator
+      - name: Install KubeRay Operator
+        run: |
+          # Create namespace for KubeRay
+          kubectl create namespace ray-system --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Install KubeRay operator
+          helm install kuberay-operator kuberay/kuberay-operator \
+            --namespace ray-system \
+            --wait
+          
+          echo "Verifying KubeRay operator installation:"
+          kubectl -n ray-system get pods
+          kubectl get crds | grep ray.io
+
+      # Add this step after installing the KubeRay operator
+      - name: Deploy with KubeRay
+        run: |
+          # Make the script executable
+          chmod +x scripts/deploy-kuberay.sh
+
+          # Deploy using the script
+          ./scripts/deploy-kuberay.sh ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }} ${{ env.RAY_TAG }}
+
+          # Wait for deployment
+          echo "Waiting for Ray Cluster to be ready..."
+          kubectl -n llama wait --for=condition=established --timeout=5m \
+            crd/rayclusters.ray.io \
+            crd/rayservices.ray.io
+          
+          kubectl -n llama wait --for=condition=ready --timeout=5m rayservice/llama-ray-service || true
+          
+          # Show deployment status
+          echo "Ray Service status:"
+          kubectl -n llama get rayservice
+          
+          echo "Ray Cluster status:"
+          kubectl -n llama get raycluster
+          
+          echo "Ray Pods:"
+          kubectl -n llama get pods -l ray.io/cluster=llama-ray-cluster 
+          # Deploy LLaMA with Helm and KubeRay
+      - name: Deploy LLaMA with Helm
+        run: |
+          # Create llama namespace
+          kubectl create namespace llama --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create small dummy model for testing
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: dummy-model
+            namespace: llama
+          data:
+            model.gguf: |
+              DUMMY_MODEL_DATA_FOR_TESTING_ONLY
+          EOF
+          
+          # Create PVC for models
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: llama-models
+            namespace: llama
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 100Mi
+          EOF
+          
+          # Wait for PVC to be created
+          kubectl -n llama wait --for=condition=Ready --timeout=30s pvc/llama-models || true
+          
+          # Copy dummy model to PVC
+          cat <<EOF | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: model-setup
+            namespace: llama
+          spec:
+            ttlSecondsAfterFinished: 100
+            template:
+              spec:
+                containers:
+                - name: model-setup
+                  image: busybox
+                  command: ["sh", "-c", "cp /dummy/model.gguf /models/model.gguf && echo 'Dummy model copied'"]
+                  volumeMounts:
+                  - name: dummy-model
+                    mountPath: /dummy
+                  - name: models
+                    mountPath: /models
+                volumes:
+                - name: dummy-model

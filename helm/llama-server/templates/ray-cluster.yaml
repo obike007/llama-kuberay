@@ -1,0 +1,76 @@
+{{- if .Values.ray.enabled }}
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: {{ .Values.ray.cluster.name | default (printf "%s-ray-cluster" (include "llama-server.fullname" .)) }}
+  namespace: {{ .Values.ray.cluster.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "llama-server.labels" . | nindent 4 }}
+spec:
+  rayVersion: {{ .Values.ray.version | quote }}
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: '0.0.0.0'
+      block: 'true'
+    replicas: {{ .Values.ray.cluster.head.replicas }}
+    serviceAccountName: {{ .Values.ray.cluster.head.serviceAccount }}
+    enableInTreeAutoscaling: {{ .Values.ray.cluster.head.enableInTreeAutoscaling }}
+    template:
+      spec:
+        containers:
+        - name: ray-head
+          image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+          {{- range .Values.ray.cluster.head.ports }}
+            - containerPort: {{ .containerPort }}
+              name: {{ .name }}
+              {{- if .hostPort }}
+              hostPort: {{ .hostPort }}
+              {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.ray.cluster.head.resources | nindent 12 }}
+          volumeMounts:
+          {{- range .Values.ray.cluster.head.volumeMounts }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath }}
+          {{- end }}
+        volumes:
+        {{- range .Values.ray.cluster.head.volumeMounts }}
+          - name: {{ .name }}
+            {{- if eq .name "models" }}
+            persistentVolumeClaim:
+              claimName: {{ $.Values.persistence.name | default (printf "%s-models" (include "llama-server.fullname" $)) }}
+            {{- end }}
+        {{- end }}
+  workerGroupSpecs:
+  {{- range .Values.ray.cluster.worker.groups }}
+    - groupName: {{ .name }}
+      replicas: {{ .replicas }}
+      minReplicas: {{ .minReplicas }}
+      maxReplicas: {{ .maxReplicas }}
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+          - name: ray-worker
+            image: {{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}
+            imagePullPolicy: {{ $.Values.image.pullPolicy }}
+            resources:
+              {{- toYaml .resources | nindent 14 }}
+            volumeMounts:
+            {{- range .volumeMounts }}
+              - name: {{ .name }}
+                mountPath: {{ .mountPath }}
+            {{- end }}
+          volumes:
+          {{- range .volumeMounts }}
+            - name: {{ .name }}
+              {{- if eq .name "models" }}
+              persistentVolumeClaim:
+                claimName: {{ $.Values.persistence.name | default (printf "%s-models" (include "llama-server.fullname" $)) }}
+              {{- end }}
+          {{- end }}
+  {{- end }}
+{{- end }}

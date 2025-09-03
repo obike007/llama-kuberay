@@ -1,0 +1,41 @@
+{{- if and .Values.ray.enabled .Values.rayService.enabled }}
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: {{ .Values.rayService.name | default (printf "%s-ray-service" (include "llama-server.fullname" .)) }}
+  namespace: {{ .Values.rayService.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "llama-server.labels" . | nindent 4 }}
+spec:
+  rayClusterName: {{ .Values.ray.cluster.name | default (printf "%s-ray-cluster" (include "llama-server.fullname" .)) }}
+  serveConfigV2:
+    importPath: {{ .Values.rayService.serveConfig.importPath }}
+    runtimeEnv:
+      workingDir: {{ .Values.rayService.serveConfig.runtimeEnv.workingDir }}
+      {{- if .Values.rayService.serveConfig.runtimeEnv.pip }}
+      pip:
+        {{- toYaml .Values.rayService.serveConfig.runtimeEnv.pip | nindent 8 }}
+      {{- end }}
+    deployments:
+    {{- range .Values.rayService.serveConfig.deployments }}
+      - name: {{ .name }}
+        numReplicas: {{ .numReplicas }}
+        {{- if .userConfig }}
+        userConfig: 
+          {{- toYaml .userConfig | nindent 10 }}
+        {{- end }}
+        rayActorOptions:
+          numCpus: {{ .rayActorOptions.numCpus }}
+          numGpus: {{ .rayActorOptions.numGpus }}
+          {{- if .rayActorOptions.resources }}
+          resources:
+            {{- toYaml .rayActorOptions.resources | nindent 12 }}
+          {{- end }}
+    {{- end }}
+  service:
+    type: {{ .Values.rayService.service.type }}
+    port: {{ .Values.rayService.service.port }}
+    {{- if and (eq .Values.rayService.service.type "NodePort") .Values.rayService.service.nodePort }}
+    nodePort: {{ .Values.rayService.service.nodePort }}
+    {{- end }}
+{{- end }}
