@@ -356,43 +356,50 @@ jobs:
           no-cache: true
 
       # Build and push Ray integration image
-      - name: Build Ray integration image
+      - name: Build and push Ray integration image
         run: |
-          # Create the Ray Dockerfile
-          cat > Dockerfile.ray << EOF
-          FROM rayproject/ray:2.9.0
-          
-          # Install Python dependencies for LLaMA and metrics
-          RUN pip install prometheus-client requests psutil
-          
-          # Create directories for LLaMA
-          RUN mkdir -p /models /app/metrics /app/ray_serve && \\
-              chmod -R 777 /models /app
-          
-          # Copy the LLaMA server binary and libraries
-          COPY --from=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} /usr/local/bin/llama-server /usr/local/bin/
-          COPY --from=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} /usr/local/lib/*.so /usr/local/lib/ 2>/dev/null || true
-          RUN ldconfig
-          
-          # Copy the metrics exporter script
-          COPY metrics/exporter.py /app/metrics/exporter.py
-          RUN chmod +x /app/metrics/exporter.py
-          
-          # Copy Ray serve script
-          COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
-          EOF
-          
           # Set Ray image tag
           RAY_TAG="${{ steps.meta.outputs.version || 'latest' }}-ray"
           echo "RAY_TAG=$RAY_TAG" >> $GITHUB_ENV
-          
+
+          # Create a temporary Dockerfile for Ray image
+          cat > Dockerfile.ray.tmp << 'EOF'
+          # Stage 1: Extract from llama-server image
+          FROM ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version || 'latest' }} as llama-image
+
+          # Stage 2: Build the Ray image
+          FROM rayproject/ray:2.9.0
+
+          # Install Python dependencies for LLaMA and metrics
+          RUN pip install prometheus-client requests psutil
+
+          # Create directories for LLaMA
+          RUN mkdir -p /models /app/metrics /app/ray_serve && \
+              chmod -R 777 /models /app
+
+          # Copy the LLaMA server binary from the first stage
+          COPY --from=llama-image /usr/local/bin/llama-server /usr/local/bin/
+
+          # Copy libraries directory
+          RUN mkdir -p /usr/local/lib
+          COPY --from=llama-image /usr/local/lib/ /usr/local/lib/ || true
+          RUN ldconfig
+
+          # Copy the metrics exporter script
+          COPY metrics/exporter.py /app/metrics/exporter.py
+          RUN chmod +x /app/metrics/exporter.py
+
+          # Copy Ray serve script
+          COPY ray_serve/llama_serve.py /app/ray_serve/llama_serve.py
+          EOF
+
           if [[ "${{ github.event_name }}" != "pull_request" ]]; then
             # For actual pushes, build and push to Docker Hub
-            docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray .
+            docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray.tmp .
             docker push ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG}
           else
             # For PRs, just build locally
-            docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray .
+            docker build -t ${{ env.REGISTRY }}/${{ env.RAY_IMAGE_NAME }}:${RAY_TAG} -f Dockerfile.ray.tmp .
           fi
 
       # Install kubectl and kind
