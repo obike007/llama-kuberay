@@ -19,39 +19,6 @@ Helm: Kubernetes package manager used for deploying all components.
 
 KIND: Kubernetes IN Docker, used for local testing.
 
-.
-├── .github/
-│   └── workflows/         # CI/CD pipeline definitions
-│       └── ci-cd.yml      # Main CI/CD workflow
-├── configs/
-│   └── supervisord.conf   # Supervisor configuration for process management
-├── docker/
-│   └── Dockerfile         # Main Dockerfile for LLaMA server
-├── helm/
-│   └── llama-server/      # Helm chart for LLaMA server with KubeRay
-│       ├── Chart.yaml
-│       ├── values.yaml
-│       └── templates/
-│           ├── _helpers.tpl
-│           ├── deployment.yaml
-│           ├── pvc.yaml
-│           ├── ray-cluster.yaml  # KubeRay cluster definition
-│           ├── ray-service.yaml  # KubeRay service definition
-│           └── service.yaml
-├── metrics/
-│   └── exporter.py        # Prometheus metrics exporter
-├── monitoring/
-│   ├── prometheus-values.yaml     # Prometheus configuration
-│   └── dashboards/
-│       └── llama-dashboard.json   # Grafana dashboard definition
-├── ray_serve/
-│   └── llama_serve.py     # Ray Serve application script
-├── scripts/
-│   ├── setup-kind.sh      # Script to set up KIND cluster
-│   └── test-ray-service.py  # Testing script for Ray service
-└── README.md              # This file
-
-
 Setup Process
 Prerequisites
 Before starting, ensure you have the following tools installed:
