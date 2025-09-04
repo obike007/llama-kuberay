@@ -19,7 +19,6 @@ Helm: Kubernetes package manager used for deploying all components.
 
 KIND: Kubernetes IN Docker, used for local testing.
 
-Directory Structure
 .
 ├── .github/
 │   └── workflows/         # CI/CD pipeline definitions
@@ -51,6 +50,7 @@ Directory Structure
 │   ├── setup-kind.sh      # Script to set up KIND cluster
 │   └── test-ray-service.py  # Testing script for Ray service
 └── README.md              # This file
+
 
 Setup Process
 Prerequisites
